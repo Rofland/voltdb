@@ -27,6 +27,7 @@ import java.util.TreeSet;
 
 import org.hsqldb_voltpatches.FunctionForVoltDB;
 import org.json_voltpatches.JSONException;
+import org.voltcore.logging.VoltLogger;
 import org.voltdb.VoltType;
 import org.voltdb.catalog.Column;
 import org.voltdb.catalog.ColumnRef;
@@ -62,6 +63,7 @@ import org.voltdb.types.SortDirectionType;
 import org.voltdb.utils.CatalogUtil;
 
 public abstract class SubPlanAssembler {
+    private static final VoltLogger m_logger = new VoltLogger("PLANNER");
 
     /** The parsed statement structure that has the table and predicate info we need. */
     final AbstractParsedStmt m_parsedStmt;
@@ -1173,7 +1175,23 @@ public abstract class SubPlanAssembler {
             ExpressionOrColumn fromIndx = (m_indexEntryNumber < 0) ? other : this;
             return (findBindingsForOneIndexedExpression(fromStmt, fromIndx) != null);
         }
-
+        /**
+         * This is just used for debugging.  Don't try to extract too
+         * much information from this.
+         */
+        @Override
+        public String toString() {
+            if (m_expr != null) {
+                return String.format("Expression(%s)", m_expr);
+            }
+            if (m_colRef != null) {
+                return String.format("ColumnRef(%s(%s).%s)",
+                                     ((m_tableScan == null) ? "<none>" : m_tableScan.getTableName()),
+                                     ((m_tableScan == null) ? "<none>" : m_tableScan.getTableAlias()),
+                                     m_colRef.getTypeName());
+            }
+            return "NullExpressionOrColumn()";
+        }
     }
 
     /**
@@ -1422,16 +1440,21 @@ public abstract class SubPlanAssembler {
      * match.
      */
     class WindowFunctionScoreboard {
-        public WindowFunctionScoreboard(ParsedSelectStmt pss, StmtTableScan tableScan) {
+        public WindowFunctionScoreboard(AbstractParsedStmt parsedStmt, StmtTableScan tableScan) {
+            // The window functions are in the
+            // ParsedSelectStmt class only. We may
+            // not have a ParsedSelectStmt, so we
+            // have to be careful.
+            ParsedSelectStmt pss = (parsedStmt instanceof ParsedSelectStmt) ? (ParsedSelectStmt)parsedStmt : null;
             m_numWinScores = (pss != null) ? pss.getWindowFunctionExpressions().size() : 0;
-            m_numOrderByScores = ((pss != null) && pss.hasOrderByColumns() ? 1 : 0);
+            m_numOrderByScores = ((parsedStmt != null) && parsedStmt.hasOrderByColumns() ? 1 : 0);
             m_winFunctions = new WindowFunctionScore[m_numWinScores + m_numOrderByScores];
             for (int idx = 0; idx < m_numWinScores; idx += 1) {
-                m_winFunctions[idx] = new WindowFunctionScore(pss.getWindowFunctionExpressions().get(idx),
+                m_winFunctions[idx] = new WindowFunctionScore(parsedStmt.getWindowFunctionExpressions().get(idx),
                                                               idx);
             }
             if (m_numOrderByScores > 0) {
-                m_winFunctions[m_numWinScores] = new WindowFunctionScore(pss.orderByColumns());
+                m_winFunctions[m_numWinScores] = new WindowFunctionScore(parsedStmt.orderByColumns());
             }
         }
 
@@ -1590,6 +1613,23 @@ public abstract class SubPlanAssembler {
                     numOrderSpoilers = m_orderSpoilers.size();
                 }
             }
+            if (m_logger.isDebugEnabled()) {
+                String indexName = (retval.index == null) ? "<None>" : retval.index.toString();
+                if (answer != null) {
+                    m_logger.debug(String.format("WindowFunctionScoreboard: found index %s for %s %s",
+                                                 indexName,
+                                                 answer.m_isWindowFunction ? "Window Function" : "Statement Order By",
+                                                 answer.m_windowFunctionNumber));
+                    m_logger.debug(String.format("    %d order spoilers", numOrderSpoilers));
+                    m_logger.debug(String.format("    Sort Direction: %s",
+                                                 retval.sortDirection));
+                    m_logger.debug(String.format("    Order By %s compatible with the index",
+                                                 (retval.m_stmtOrderByIsCompatible ? "is" : "is not")));
+                } else {
+                    m_logger.debug(String.format("Index %s does not help anything",
+                                                 indexName));
+                }
+            }
             return numOrderSpoilers;
         }
     }
@@ -1643,6 +1683,7 @@ public abstract class SubPlanAssembler {
         // return 0.
         //
         if (! hasOrderBy && ! hasWindowFunctions) {
+            m_logger.debug("determineIndexOrder: No order by or window functions.");
             return 0;
         }
         //
@@ -1693,7 +1734,11 @@ public abstract class SubPlanAssembler {
         // We keep a scoreboard which keeps track of everything.  All the window
         // functions and statement level order by functions are kept in the scoreboard.
         //
-        WindowFunctionScoreboard windowFunctionScores = new WindowFunctionScoreboard(pss, tableScan);
+        m_logger.debug(String.format("determineIndexOrdering: matching index %s on table %s(%s)",
+                                     ((retval.index == null) ? "none" : retval.index),
+                                     tableScan.getTableName(),
+                                     tableScan.getTableAlias()));
+        WindowFunctionScoreboard windowFunctionScores = new WindowFunctionScoreboard(m_parsedStmt, tableScan);
         // indexCtr is an index into the index expressions or columns.
         for (int indexCtr = 0; !windowFunctionScores.isDone() && indexCtr < keyComponentCount; indexCtr += 1) {
             // Figure out what to do with index expression or column at indexCtr.
@@ -1705,11 +1750,15 @@ public abstract class SubPlanAssembler {
             // another.  If it doesn't match anything, it may
             // be an order spoiler, which we will maintain in
             // the scoreboard.
-            windowFunctionScores.matchIndexEntry(new ExpressionOrColumn(indexCtr,
+            ExpressionOrColumn indexExprToMatch = new ExpressionOrColumn(indexCtr,
                                                                         tableScan,
                                                                         indexExpr,
                                                                         SortDirectionType.INVALID,
-                                                                        indexColRef));
+                                                                        indexColRef);
+            m_logger.debug(String.format("Matching index expression %d: %s",
+                                         indexCtr,
+                                         indexExprToMatch));
+            windowFunctionScores.matchIndexEntry(indexExprToMatch);
         }
         //
         // The result is the number of order spoilers, but
